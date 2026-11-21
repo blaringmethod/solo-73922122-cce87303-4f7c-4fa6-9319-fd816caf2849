@@ -6,14 +6,22 @@
 ----
 一个回次有 n 个按顺序排列的岩芯段，段实长 L_j。相邻段 j-1 与 j 之间的
 缺失长度 g_j 满足 low_j <= g_j <= high_j（共 n-1 个变量）。
-令 P_0 = 0，P_j = g_1 + ... + g_j（前 j 个缺失量之和），则
 
-    段 j 起点孔深  s_j = 回次起点 + P_j
+令 P_0 = 0，P_j = g_1 + ... + g_j（前 j 个缺失量之和），并令
+C_j = L_0 + ... + L_{j-1}（第 j 段之前已有的岩芯实长合计，C_0 = 0），则
+
+    段 j 起点孔深  s_j = 回次起始孔深 + C_j + P_j
     段 j 终点孔深  e_j = s_j + L_j
 
-回次起止孔深之差必须容纳全部岩芯：P_{n-1} <= (终孔 - 起始) - 各段实长之和，
-即顶部（或终孔处）剩余缺失为非负自由量。数据员录入的段起点实测孔深
-等价于等式约束 P_j = 实测值 - 回次起始。
+即孔深 = 回次起始 + 前段岩芯实长 + 前段缺失量。早期版本漏掉了 C_j，
+实测起点被当成“起始孔深 + 缺失量”，后段会整体前移并与前段重叠，
+样品因此可能被算进错误地层；按旧语义补录的实测起点在新规则下还会无解。
+
+回次起止孔深之差必须容纳全部岩芯与缺失：
+P_{n-1} <= (终孔 - 起始) - 各段实长之和，顶部（或终孔处）剩余缺失为
+非负自由量。数据员录入的段起点实测孔深是**绝对孔深**，等价于等式约束
+
+    P_j = 实测起点孔深 - 回次起始孔深 - C_j
 
 对每个前缀 P_j 分别求所有可行排布下的最小值/最大值，即可得到各段、各样品
 起止孔深的可行范围。
@@ -93,6 +101,7 @@ class RunResult:
     run_id: str
     start_depth: int
     end_depth: int
+    core_offsets: list[int]  # C_j：第 j 段之前的岩芯实长合计
     seg_start_lo: list[int]
     seg_start_hi: list[int]
     seg_end_lo: list[int]
@@ -221,6 +230,8 @@ def parse_payload(payload: dict) -> RunInput:
     if any(not name for name in layers):
         raise ValidationError("地层名称不能为空字符串")
 
+    # 先算各段之前的岩芯实长合计，用于实测孔深的绝对位置校验
+    core_offsets = _core_offsets(segments)
     raw_measured = payload.get("measured_starts", [])
     if not isinstance(raw_measured, list):
         raise ValidationError("实测段起点 measured_starts 必须是数组")
@@ -245,6 +256,15 @@ def parse_payload(payload: dict) -> RunInput:
             raise ValidationError(
                 f"第 {seg_index + 1} 段实测起点孔深 {depth} 不小于回次终止孔深 {end_depth}"
             )
+        # 实测点之前已经有 C_j 毫米岩芯，实测孔深不得早于“起始 + 前段岩芯实长”
+        earliest = start_depth + core_offsets[seg_index]
+        if depth < earliest:
+            raise InfeasibleError(
+                "约束无解（当前供数未做任何改动）："
+                f"第 {seg_index + 1} 段实测起点 {depth} mm 早于该段最早可能位置 "
+                f"{earliest} mm（回次起始 {start_depth} mm + 前段岩芯实长合计 "
+                f"{core_offsets[seg_index]} mm），两段岩芯将发生重叠。"
+            )
         measured.append(MeasuredStart(seg_index, depth))
         seen_seg.add(seg_index)
 
@@ -258,6 +278,14 @@ def parse_payload(payload: dict) -> RunInput:
     return RunInput(run_id, start_depth, end_depth, segments, gaps, boundaries, layers, measured)
 
 
+def _core_offsets(segments: list[SegmentInput]) -> list[int]:
+    """C_j = 第 j 段之前各段实长之和（C_0 = 0）。"""
+    offsets = [0]
+    for seg in segments[:-1]:
+        offsets.append(offsets[-1] + seg.length)
+    return offsets
+
+
 # --------------------------------------------------------------------------- #
 # 可行区间求解
 # --------------------------------------------------------------------------- #
@@ -268,11 +296,15 @@ def solve(run: RunInput) -> RunResult:
     total_core = sum(seg.length for seg in run.segments)
     total_span = run.end_depth - run.start_depth
     total_gap_max = total_span - total_core  # P_m 的上限
+    core_offsets = _core_offsets(run.segments)
 
-    # 前缀 P 的等式锚点：P_0 = 0 恒成立，实测点补充等式约束
+    # 前缀 P 的等式锚点：P_0 = 0 恒成立；实测点是绝对孔深，
+    # 换算成缺失前缀 P_j = 实测孔深 - 回次起始 - 前段岩芯实长 C_j。
     anchors: dict[int, int] = {0: 0}
     for ms in run.measured_starts:
-        anchors[ms.seg_index] = ms.depth - run.start_depth
+        anchors[ms.seg_index] = (
+            ms.depth - run.start_depth - core_offsets[ms.seg_index]
+        )
 
     # 每个前缀 P_j 的可行范围 [lo, hi]
     p_lo = [0] * n
@@ -287,7 +319,7 @@ def solve(run: RunInput) -> RunResult:
         delta = anchors[k] - anchors[j]
         if not (fixed_lo <= delta <= fixed_hi):
             raise InfeasibleError(
-                _anchor_conflict_msg(run, j, k, anchors[j], anchors[k], fixed_lo, fixed_hi, delta)
+                _anchor_conflict_msg(run, j, k, anchors, core_offsets, fixed_lo, fixed_hi, delta)
             )
         # 块内逐点求紧边界（q = P_{t+1} - P_j，块总量 delta 已固定）。
         # 下界取最大：本块变量全取下限、为其后变量保留 high 空间；
@@ -313,9 +345,7 @@ def solve(run: RunInput) -> RunResult:
     tail_low = sum(run.gaps[t].low for t in range(j, m))
     if anchors[j] + tail_low > total_gap_max:
         raise InfeasibleError(
-            f"约束无解（当前供数未做任何改动）：第 {j + 1} 段实测起点之后各缺失段下限合计 "
-            f"{tail_low} mm，而该实测点（{run.start_depth + anchors[j]} mm）到回次终孔之间"
-            f"最多只能再容纳 {total_gap_max - anchors[j]} mm 的缺失。"
+            _tail_overflow_msg(run, j, anchors[j], core_offsets, tail_low, total_gap_max)
         )
     block_low = block_high = 0
     for t in range(j, m):
@@ -336,13 +366,13 @@ def solve(run: RunInput) -> RunResult:
         if q_lo > q_hi:
             raise InfeasibleError(
                 f"约束无解：第 {t + 2} 段起点的可行下界 "
-                f"{run.start_depth + p_lo[t + 1]} mm 高于可行上界 "
-                f"{run.start_depth + p_hi[t + 1]} mm。"
+                f"{run.start_depth + core_offsets[t + 1] + p_lo[t + 1]} mm 高于可行上界 "
+                f"{run.start_depth + core_offsets[t + 1] + p_hi[t + 1]} mm。"
             )
 
-    # 换算为绝对孔深，并推导样品可行范围与层位
-    seg_start_lo = [run.start_depth + v for v in p_lo]
-    seg_start_hi = [run.start_depth + v for v in p_hi]
+    # 换算为绝对孔深：s_j = 回次起始 + C_j + P_j，并推导样品可行范围与层位
+    seg_start_lo = [run.start_depth + core_offsets[i] + v for i, v in enumerate(p_lo)]
+    seg_start_hi = [run.start_depth + core_offsets[i] + v for i, v in enumerate(p_hi)]
     seg_end_lo = [seg_start_lo[i] + run.segments[i].length for i in range(n)]
     seg_end_hi = [seg_start_hi[i] + run.segments[i].length for i in range(n)]
 
@@ -375,6 +405,7 @@ def solve(run: RunInput) -> RunResult:
         run.run_id,
         run.start_depth,
         run.end_depth,
+        core_offsets,
         seg_start_lo,
         seg_start_hi,
         seg_end_lo,
@@ -385,15 +416,41 @@ def solve(run: RunInput) -> RunResult:
     )
 
 
-def _anchor_conflict_msg(run, j, k, pj, pk, fixed_lo, fixed_hi, delta) -> str:
+def _anchor_conflict_msg(
+    run, j, k, anchors, core_offsets, fixed_lo, fixed_hi, delta
+) -> str:
+    """等式块无解说明，全部使用数据员录入的绝对孔深表述。"""
+    left_depth = run.start_depth + core_offsets[j] + anchors[j]
+    right_depth = run.start_depth + core_offsets[k] + anchors[k]
     left = "回次起始孔深" if j == 0 else f"第 {j + 1} 段实测起点"
-    left_depth = run.start_depth + pj
-    right_depth = run.start_depth + pk
+    core_between = core_offsets[k] - core_offsets[j]
+    if delta < 0:
+        return (
+            "约束无解（当前供数未做任何改动）："
+            f"{left}（{left_depth} mm）晚于第 {k + 1} 段实测起点（{right_depth} mm），"
+            f"扣除两点之间的岩芯实长 {core_between} mm 后缺失量为负数（{delta} mm），"
+            "相邻岩芯段必然重叠，请核对实测孔深或段实长。"
+        )
     return (
         "约束无解（当前供数未做任何改动）："
         f"{left}（{left_depth} mm）与第 {k + 1} 段实测起点（{right_depth} mm）之间，"
-        f"各缺失段允许的合计缺失为 [{fixed_lo}, {fixed_hi}] mm，"
-        f"但两点孔深之差为 {delta} mm，不存在满足上下限的排布。"
+        f"扣除两点间岩芯实长 {core_between} mm 后，缺失量须为 {delta} mm，"
+        f"但各缺失段允许的合计缺失仅为 [{fixed_lo}, {fixed_hi}] mm，"
+        "不存在满足上下限的排布。"
+    )
+
+
+def _tail_overflow_msg(run, j, pj, core_offsets, tail_low, total_gap_max) -> str:
+    anchor_depth = run.start_depth + core_offsets[j] + pj
+    # 锚点之后还需安放的岩芯（含本段 L_j）与缺失下限
+    remaining_core = sum(seg.length for seg in run.segments[j:])
+    capacity = run.end_depth - anchor_depth
+    return (
+        "约束无解（当前供数未做任何改动）："
+        f"第 {j + 1} 段实测起点（{anchor_depth} mm）到回次终孔（{run.end_depth} mm）"
+        f"只剩 {capacity} mm，但其后还需容纳岩芯实长 {remaining_core} mm 与至少 "
+        f"{tail_low} mm 的段间缺失（合计 {remaining_core + tail_low} mm），"
+        "超出终孔范围，请核对实测孔深。"
     )
 
 

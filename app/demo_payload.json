@@ -22,13 +22,20 @@
       "samples": [
         {"sample_no": "S5", "start": 500, "end": 650, "assay": "1.05"}
       ]
+    },
+    {
+      "length": 400,
+      "samples": [
+        {"sample_no": "S6", "start": 50, "end": 200, "assay": "0.66"}
+      ]
     }
   ],
   "gaps": [
     {"low": 100, "high": 300},
-    {"low": 100, "high": 300}
+    {"low": 50, "high": 200},
+    {"low": 50, "high": 150}
   ],
-  "boundaries": [11200],
+  "boundaries": [11100],
   "layers": ["A层-强风化", "B层-中风化"],
   "measured_starts": []
 }

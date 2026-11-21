@@ -1,4 +1,8 @@
-"""引擎求解器单元测试：可行区间、实测锚点、地层判定与无解场景。"""
+"""引擎求解器单元测试：可行区间、实测锚点、地层判定、无解与重叠场景。
+
+规则 v2：段起点孔深 = 回次起始 + 前段岩芯实长 C_j + 前段缺失 P_j；
+实测起点为绝对孔深，等价于 P_j = 实测孔深 - 回次起始 - C_j。
+"""
 
 import pytest
 
@@ -25,9 +29,16 @@ DEMO = {
         {"length": 700, "samples": [
             {"sample_no": "S5", "start": 500, "end": 650, "assay": "1.05"},
         ]},
+        {"length": 400, "samples": [
+            {"sample_no": "S6", "start": 50, "end": 200, "assay": "0.66"},
+        ]},
     ],
-    "gaps": [{"low": 100, "high": 300}, {"low": 100, "high": 300}],
-    "boundaries": [11200],
+    "gaps": [
+        {"low": 100, "high": 300},
+        {"low": 50, "high": 200},
+        {"low": 50, "high": 150},
+    ],
+    "boundaries": [11100],
     "layers": ["A", "B"],
     "measured_starts": [],
 }
@@ -35,67 +46,93 @@ DEMO = {
 
 def test_open_bounds_ranges():
     result = solve(parse_payload(DEMO))
-    # P1 ∈ [100,300]（受 g1 自身上限约束），P2 ∈ [200,600]（总缺失上限 = 2500-1800 = 700）
-    assert result.seg_start_lo == [10000, 10100, 10200]
-    assert result.seg_start_hi == [10000, 10300, 10600]
-    assert result.seg_end_hi[2] == 11300  # 最后一段终点最大 11300，顶部至少留 1200
-    assert result.total_gap_high == 700
+    # 段起点 = 10000 + C_j + P_j，C = [0, 500, 1100, 1800]
+    # P1 ∈ [100,200]（受尾预算 300 反向收紧）；P2 ∈ [150,250]；P3 ∈ [200,300]
+    assert result.core_offsets == [0, 500, 1100, 1800]
+    assert result.seg_start_lo == [10000, 10600, 11250, 12000]
+    assert result.seg_start_hi == [10000, 10700, 11350, 12100]
+    # 段间绝不重叠：每段起点下界 = 前段起点下界 + 前段实长 + 缺失下限
+    for j in range(1, 4):
+        assert result.seg_start_lo[j] >= result.seg_end_lo[j - 1] + DEMO["gaps"][j - 1]["low"]
+    assert result.total_gap_high == 300
 
     by_no = {s.sample_no: s for s in result.samples}
-    # S1 段内 [20,100)，起点随段起点整体平移
+    # S1 在段 0，位置固定：[10020,10100)
     assert (by_no["S1"].start_lo, by_no["S1"].start_hi) == (10020, 10020)
     assert (by_no["S1"].end_lo, by_no["S1"].end_hi) == (10100, 10100)
-    # S5 段内 [500,650)，位于段 2：起点 [10700,11100]，终点 [10850,11250)
-    assert (by_no["S5"].start_lo, by_no["S5"].start_hi) == (10700, 11100)
-    assert (by_no["S5"].end_lo, by_no["S5"].end_hi) == (10850, 11250)
+    # S4 在段 1 段内 [400,460)：段起点 [10600,10700]
+    assert (by_no["S4"].start_lo, by_no["S4"].start_hi) == (11000, 11100)
+    assert (by_no["S4"].end_lo, by_no["S4"].end_hi) == (11060, 11160)
+    # S6 在段 3，段内 [50,200)：段起点 [12000,12100]
+    assert (by_no["S6"].start_lo, by_no["S6"].start_hi) == (12050, 12150)
+    assert (by_no["S6"].end_lo, by_no["S6"].end_hi) == (12200, 12300)
 
 
 def test_layer_classification_crossing_and_fixed():
     result = solve(parse_payload(DEMO))
     by_no = {s.sample_no: s for s in result.samples}
-    # S1/S2 永远在 A；S5 跨越 11200 分界，层位不唯一
+    # S1/S2/S3 永远在 A；S6 永远在 B；S4 跨越 11100 分界，层位不唯一
     assert by_no["S1"].layer == "A" and by_no["S2"].layer == "A"
-    assert by_no["S5"].layer is None and "11200" in by_no["S5"].reason
-    layers = {s.sample_no: s.layer for s in result.samples}
-    assert layers["S3"] == "A" and layers["S4"] == "A"
+    assert by_no["S3"].layer == "A"
+    assert by_no["S6"].layer == "B"
+    assert by_no["S4"].layer is None and "11100" in by_no["S4"].reason
+    # S5 整体位于 B 层（起点最小 11800 > 11200）
+    assert by_no["S5"].layer == "B"
 
 
 def test_measured_anchor_narrows_and_fixes_layer():
     payload = dict(DEMO)
-    payload["measured_starts"] = [{"seg_index": 1, "depth": 10300}]
+    # 实测段 1 起点 10700（绝对孔深）→ P1 = 10700-10000-500 = 200
+    payload["measured_starts"] = [{"seg_index": 1, "depth": 10700}]
     result = solve(parse_payload(payload))
-    # P1 被钉为 300：段 1 起点固定；段 2 起点受 g2 ∈ [100,300] 约束为 [10400,10600]
-    assert result.seg_start_lo[1] == result.seg_start_hi[1] == 10300
-    assert result.seg_start_lo[2] == 10400 and result.seg_start_hi[2] == 10600
+    assert result.seg_start_lo[1] == result.seg_start_hi[1] == 10700
+    # 段 2：10000 + 1100 + (200 + g2)，g2 ∈ [50,200]，再为 g3 保留下限 50 后
+    # 受尾预算（P3 ≤ 300）收紧：P2 ≤ 300-50 = 250，段 2 起点固定为 11350
+    assert result.seg_start_lo[2] == 11350 and result.seg_start_hi[2] == 11350
     by_no = {s.sample_no: s for s in result.samples}
-    # S5 此时范围 [10900,11100]..[11050,11250) 仍跨分界 → 仍不入仓
-    assert by_no["S5"].layer is None
+    # S4 固定段 1：[11100,11160)，起点恰为分界，左闭右开下完整落入 B
+    assert by_no["S4"].layer == "B"
 
+    # 再钉段 2 起点 11350 → P2 = 11350-10000-1100 = 250，即 g2 = 50
     payload["measured_starts"] = [
-        {"seg_index": 1, "depth": 10300},
-        {"seg_index": 2, "depth": 10400},
+        {"seg_index": 1, "depth": 10700},
+        {"seg_index": 2, "depth": 11350},
     ]
     result = solve(parse_payload(payload))
     by_no = {s.sample_no: s for s in result.samples}
-    # 段 2 固定在 10400：S5 = [10900,11050)，完整落入 A
-    assert by_no["S5"].layer == "A"
-    assert result.seg_start_lo == result.seg_start_hi == [10000, 10300, 10400]
+    assert result.seg_start_lo[1] == result.seg_start_hi[1] == 10700
+    assert result.seg_start_lo[2] == result.seg_start_hi[2] == 11350
+    # 段 3：g3 = P3 - P2 = 300 - 250 = 50，段 3 固定在 12100
+    assert result.seg_start_lo[3] == result.seg_start_hi[3] == 12100
+    assert by_no["S4"].layer == "B" and by_no["S6"].layer == "B"
 
 
 def test_infeasible_anchor_between_two_measurements():
     payload = dict(DEMO)
-    # P1 = 500 超出 g1 ∈ [100,300]
-    payload["measured_starts"] = [{"seg_index": 1, "depth": 10500}]
+    # P1 = 11000-10000-500 = 500，超出 g1 ∈ [100,300]
+    payload["measured_starts"] = [{"seg_index": 1, "depth": 11000}]
     with pytest.raises(InfeasibleError, match="约束无解"):
+        solve(parse_payload(payload))
+
+
+def test_legacy_measured_start_now_conflicts():
+    """旧规则把实测孔深当成“起始+缺失”，按旧语义补录的值在新规则下无解。"""
+    payload = dict(DEMO)
+    # 旧规则下 P1 会被当成 200（10200-10000）；新规则 P1 = 200-500 = -300，
+    # 实测点早于“起始+前段实长 10500”，岩芯重叠
+    payload["measured_starts"] = [{"seg_index": 1, "depth": 10200}]
+    with pytest.raises(InfeasibleError, match="重叠"):
         solve(parse_payload(payload))
 
 
 def test_infeasible_tail_overflow():
     payload = dict(DEMO)
-    # 段 2 起点钉到 10600（P2=600），其后段长 700 → 11300 尚可；
-    # 钉到 11000（P2=1000）超过总缺失上限 700 → 无解
-    payload["measured_starts"] = [{"seg_index": 2, "depth": 11000}]
-    with pytest.raises(InfeasibleError):
+    # 锚点本身落在等式块允许范围内（P2 = 11350-10000-1100 = 250），
+    # 但其后 g3 至少 50：P2 + 50 = 300 恰好等于总缺失上限 300，可行；
+    # 改钉段 2 起点 11400（P2 = 300），再加 g3 下限 50 → 超出总缺失上限，
+    # 末端开放块容不下，按终孔容量报无解
+    payload["measured_starts"] = [{"seg_index": 2, "depth": 11400}]
+    with pytest.raises(InfeasibleError, match="终孔"):
         solve(parse_payload(payload))
 
 
@@ -109,15 +146,14 @@ def test_equality_block_partial_sums_are_tight():
         "gaps": [{"low": 10, "high": 50}, {"low": 20, "high": 80}],
         "boundaries": [],
         "layers": ["X"],
-        # 钉死 P0=0、P2=60：g1+g2=60，g1∈[10,50]、g2∈[20,80]
-        # P 只累计缺失量，故第 3 段（seg_index=2）实测起点 = 2000 + P2 = 2060；
-        # 该段实际孔深起点还要加上前两段实长 200，即 2260
-        "measured_starts": [{"seg_index": 2, "depth": 2060}],
+        # 钉死 P2 = 60（g1+g2=60）：段 2 绝对起点 = 2000 + C2(200) + 60 = 2260
+        "measured_starts": [{"seg_index": 2, "depth": 2260}],
     }
     result = solve(parse_payload(payload))
-    # P1=g1 ∈ [max(10, 60-80)=10, min(50, 60-20)=40]
-    assert result.seg_start_lo == [2000, 2010, 2060]
-    assert result.seg_start_hi == [2000, 2040, 2060]
+    # P1=g1 ∈ [max(10,60-80)=10, min(50,60-20)=40]
+    # 段 1 起点 = 2000 + 100 + P1 ∈ [2110, 2140]
+    assert result.seg_start_lo == [2000, 2110, 2260]
+    assert result.seg_start_hi == [2000, 2140, 2260]
 
 
 def test_single_segment_run():
@@ -143,7 +179,7 @@ def test_single_segment_run():
 
 
 def test_zero_gap_bounds_allowed():
-    """缺失上下限均为 0 是合法录入，表示段间无缺失。"""
+    """缺失上下限均为 0 是合法录入，表示段间无缺失，岩芯首尾相接。"""
     payload = {
         "run_id": "R6",
         "start_depth": 0,
@@ -155,9 +191,8 @@ def test_zero_gap_bounds_allowed():
         "measured_starts": [],
     }
     result = solve(parse_payload(payload))
-    # 段起点只累计缺失量（均为 0），段实长体现在终点
-    assert result.seg_start_lo == result.seg_start_hi == [0, 0]
-    assert result.seg_end_lo == result.seg_end_hi == [100, 100]
+    assert result.seg_start_lo == result.seg_start_hi == [0, 100]
+    assert result.seg_end_lo == result.seg_end_hi == [100, 200]
 
 
 def test_partial_sum_bounds_are_tight():
@@ -177,12 +212,10 @@ def test_partial_sum_bounds_are_tight():
         "measured_starts": [],
     }
     result = solve(parse_payload(payload))
-    # 总缺失上限 = 1000-400 = 600
-    # P1: lo=10, hi=min(50, 600-20-30=550)=50
-    # P2: lo=30, hi=min(130, 600-30=570)=130
-    # P3: lo=60, hi=min(250, 600)=250
-    assert result.seg_start_lo == [0, 10, 30, 60]
-    assert result.seg_start_hi == [0, 50, 130, 250]
+    # 总缺失上限 = 1000-400 = 600；C = [0,100,200,300]
+    # P1: [10,50]，P2: [30,130]，P3: [60,250]
+    assert result.seg_start_lo == [0, 110, 230, 360]
+    assert result.seg_start_hi == [0, 150, 330, 550]
 
 
 def test_boundary_value_uses_half_open_intervals():
@@ -225,7 +258,8 @@ def test_validation_errors():
     with pytest.raises(ValidationError):
         parse_payload({**DEMO, "segments": []})
     with pytest.raises(ValidationError):
-        parse_payload({**DEMO, "gaps": [{"low": 300, "high": 100}, {"low": 0, "high": 0}]})
+        parse_payload({**DEMO, "gaps": [{"low": 300, "high": 100}, {"low": 0, "high": 0},
+                                        {"low": 0, "high": 0}]})
     bad = dict(DEMO)
     bad["segments"] = [dict(DEMO["segments"][0])]
     bad["gaps"] = []

@@ -1,11 +1,26 @@
 {% extends "base.html" %}
 {% block title %}{{ record.run_id }} - 回次详情{% endblock %}
 {% block body %}
-<h1>回次 {{ record.run_id }} <span class="muted">（当前版本 v{{ record.version }}，更新于 {{ record.updated_at }}）</span></h1>
+<h1>回次 {{ record.run_id }} <span class="muted">（当前版本 v{{ record.version }}，规则 v{{ record.rules_version }}，更新于 {{ record.updated_at }}）</span></h1>
 <p>
+  {% if record.is_active %}
   <a class="btn" href="/runs/{{ record.run_id }}/csv">下载生效入仓 CSV</a>
+  {% else %}
+  <span class="badge badge-out" style="font-size:13px;padding:6px 12px">下载已暂停：更正成功后恢复</span>
+  {% endif %}
   <a class="btn btn-secondary" href="/">返回列表</a>
 </p>
+
+{% if record.status == 'conflict' %}
+<div class="error" style="margin-bottom:18px">
+  <strong>历史实测起点与新孔深换算规则冲突，当前没有可下载供数。</strong><br>
+  该回次已按新规则（段实长计入孔深、实测起点按绝对孔深解释）重算，但重算无解，
+  按旧规则生成的供数表已停用并清空，原始录入与更正历史均保留在 SQLite 中。
+  请在下方“更正岩芯段起点实测孔深”中补录/修改实测起点；更正成功并通过求解后，
+  供数表整份重新生成，下载随之恢复。<br>
+  <span class="muted" style="color:#a61b1b">冲突原因：{{ record.conflict_note }}</span>
+</div>
+{% endif %}
 
 <h2>回次与地层信息</h2>
 <div class="card">
@@ -14,9 +29,11 @@
     回次进尺 {{ record.end_depth - record.start_depth }} mm；
     {% set ns = namespace(core_total=0) %}
     {% for seg in record.payload.segments %}{% set ns.core_total = ns.core_total + seg.length %}{% endfor %}
-    岩芯实长合计 {{ ns.core_total }} mm，
+    岩芯实长合计 {{ ns.core_total }} mm。
+    {% if record.result %}
     总缺失允许范围：<code>[{{ record.result.total_gap_low }}, {{ record.result.total_gap_high }}]</code> mm
     （上限 = 回次进尺 − 岩芯实长合计）。
+    {% endif %}
   </p>
   <p>地层分界（mm）：
     {% if record.payload.boundaries %}
@@ -24,18 +41,21 @@
     {% else %}无{% endif %}；
     层位：{% for name in record.payload.layers %}<code>{{ name }}</code>{% if not loop.last %}、{% endif %}{% endfor %}
   </p>
+  <p class="muted">段起点孔深 = 回次起始孔深 + 前段岩芯实长合计 C<sub>j</sub> + 前段缺失量 P<sub>j</sub>；实测起点按绝对孔深解释。</p>
 </div>
 
+{% if record.result %}
 <h2>岩芯段孔深可行范围</h2>
 <table>
   <thead>
-    <tr><th>段序号</th><th>实长 (mm)</th><th>起点孔深可行范围 [lo, hi]</th><th>终点孔深可行范围 [lo, hi)</th><th>已录入实测起点</th></tr>
+    <tr><th>段序号</th><th>实长 (mm)</th><th>前段岩芯实长 C<sub>j</sub> (mm)</th><th>起点孔深可行范围 [lo, hi]</th><th>终点孔深可行范围 [lo, hi)</th><th>已录入实测起点</th></tr>
   </thead>
   <tbody>
   {% for i in range(record.payload.segments | length) %}
     <tr>
       <td>{{ i }}</td>
       <td>{{ record.payload.segments[i].length }}</td>
+      <td>{{ record.result.core_offsets[i] }}</td>
       <td>[{{ record.result.seg_start_lo[i] }}, {{ record.result.seg_start_hi[i] }}]</td>
       <td>[{{ record.result.seg_end_lo[i] }}, {{ record.result.seg_end_hi[i] }})</td>
       <td>
@@ -77,12 +97,34 @@
   {% endfor %}
   </tbody>
 </table>
+{% else %}
+<h2>岩芯段与样品</h2>
+<div class="card">
+  <p class="muted">当前实测约束无解，无法推导可行孔深范围。下表仅展示原始录入的岩芯段与样品位置；待更正通过后自动恢复求解与供数表。</p>
+  <table>
+    <thead><tr><th>段序号</th><th>实长 (mm)</th><th>段内样品（编号 / 段内 [start, end) / 化验值）</th></tr></thead>
+    <tbody>
+    {% for seg in record.payload.segments %}
+      <tr>
+        <td>{{ loop.index0 }}</td>
+        <td>{{ seg.length }}</td>        <td>
+          {% for s in seg.samples %}
+            <code>{{ s.sample_no }} [{{ s.start }}, {{ s.end }}) {{ s.assay }}</code>{% if not loop.last %}；{% endif %}
+          {% else %}<span class="muted">无样品</span>{% endfor %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
 
 <h2>更正岩芯段起点实测孔深</h2>
 <div class="card">
   <p class="muted">
-    提交后整份回次重新求解并整份替换供数表，版本号 +1。若新约束无解或本页面版本已过期，
-    请求会被拒绝并说明原因，当前供数原样保留。每行一个实测点，两个文本框按行对齐；段序号从 0 开始，孔深为整数毫米。
+    提交后整份回次按新规则重新求解并整份替换供数表，版本号 +1。若新约束无解或本页面版本已过期，
+    请求会被拒绝并说明原因，当前供数原样保留。每行一个实测点，两个文本框按行对齐；段序号从 0 开始，
+    孔深为整数毫米的<b>绝对孔深</b>（不得早于回次起始 + 前段岩芯实长）。
   </p>
   <form method="post" action="/runs/{{ record.run_id }}/correct">
     <input type="hidden" name="expected_version" value="{{ record.version }}">
@@ -112,6 +154,24 @@
     <tr><td>{{ h.id }}</td><td>v{{ h.from_version }} → v{{ h.to_version }}</td><td>{{ h.note }}</td><td>{{ h.created_at }}</td></tr>
   {% else %}
     <tr><td colspan="4" class="muted">暂无更正记录（当前为导入时的版本 1）。</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>规则重算记录</h2>
+<table>
+  <thead><tr><th>#</th><th>规则变化</th><th>结果</th><th>说明</th><th>时间</th></tr></thead>
+  <tbody>
+  {% for r in recompute_history %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td>v{{ r.from_rules }} → v{{ r.to_rules }}</td>
+      <td>{% if r.status == 'active' %}<span class="badge badge-in">已生效</span>{% else %}<span class="badge badge-out">冲突待更正</span>{% endif %}</td>
+      <td>{{ r.note }}</td>
+      <td>{{ r.created_at }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">暂无规则重算记录（该回次按当前规则导入）。</td></tr>
   {% endfor %}
   </tbody>
 </table>

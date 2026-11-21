@@ -21,7 +21,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.templating import Jinja2Templates
 
 from .engine import EngineError, ValidationError
-from .storage import StaleVersionError, Store
+from .storage import StaleVersionError, Store, SupplyUnavailableError
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", BASE_DIR.parent / "data"))
@@ -111,6 +111,7 @@ def run_detail(request: Request, run_id: str):
         {
             "record": record,
             "history": store.correction_history(run_id),
+            "recompute_history": store.recompute_history(run_id),
             "flash": _pop_flash(request),
         },
     )
@@ -163,7 +164,11 @@ async def correct_submit(
 def download_csv(run_id: str):
     if store.get_run(run_id) is None:
         return JSONResponse({"error": f"回次 {run_id} 不存在"}, status_code=404)
-    csv_bytes = store.supply_csv_bytes(run_id)
+    try:
+        csv_bytes = store.supply_csv_bytes(run_id)
+    except SupplyUnavailableError as exc:
+        # 重算未完成或冲突未更正：拒绝下载并回到详情页说明原因
+        return _flash_redirect(f"/runs/{run_id}", "error", str(exc))
     return Response(
         content=csv_bytes,
         media_type="text/csv; charset=utf-8",
